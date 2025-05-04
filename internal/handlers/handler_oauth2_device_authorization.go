@@ -7,6 +7,7 @@ import (
 
 	oauthelia2 "authelia.com/provider/oauth2"
 	"authelia.com/provider/oauth2/x/errorsx"
+	"github.com/google/uuid"
 
 	"github.com/authelia/authelia/v4/internal/authentication"
 	"github.com/authelia/authelia/v4/internal/logging"
@@ -16,7 +17,7 @@ import (
 	"github.com/authelia/authelia/v4/internal/session"
 )
 
-func OAuth2DeviceAuthorizationPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, req *http.Request) {
+func OAuth2DeviceAuthorizationPOST(ctx *middlewares.AutheliaCtx, rw http.ResponseWriter, r *http.Request) {
 	var (
 		requester oauthelia2.DeviceAuthorizeRequester
 		response  oauthelia2.DeviceAuthorizeResponder
@@ -24,12 +25,12 @@ func OAuth2DeviceAuthorizationPOST(ctx *middlewares.AutheliaCtx, rw http.Respons
 		err error
 	)
 
-	if requester, err = ctx.Providers.OpenIDConnect.NewRFC862DeviceAuthorizeRequest(ctx, req); err != nil {
+	if requester, err = ctx.Providers.OpenIDConnect.NewRFC862DeviceAuthorizeRequest(ctx, r); err != nil {
 		ctx.Logger.
 			WithError(oauthelia2.ErrorToDebugRFC6749Error(err)).
 			Errorf("Device Authorization Request failed with error during the Device Authorization Flow")
 
-		errorsx.WriteJSONError(rw, req, err)
+		errorsx.WriteJSONError(rw, r, err)
 
 		return
 	}
@@ -41,7 +42,7 @@ func OAuth2DeviceAuthorizationPOST(ctx *middlewares.AutheliaCtx, rw http.Respons
 	if response, err = ctx.Providers.OpenIDConnect.NewRFC862DeviceAuthorizeResponse(ctx, requester, oidc.NewSessionWithRequestedAt(ctx.Clock.Now())); err != nil {
 		log.WithError(oauthelia2.ErrorToDebugRFC6749Error(err)).Error("Device Authorization Request had an error while trying to create a response during the Device Authorization Flow")
 
-		errorsx.WriteJSONError(rw, req, err)
+		errorsx.WriteJSONError(rw, r, err)
 
 		return
 	}
@@ -55,28 +56,48 @@ func OAuth2DeviceAuthorizationPUT(ctx *middlewares.AutheliaCtx, rw http.Response
 	var (
 		requester oauthelia2.DeviceAuthorizeRequester
 		responder oauthelia2.DeviceUserAuthorizeResponder
+		flowID    uuid.UUID
 		client    oidc.Client
+		consent   *model.OAuth2ConsentSession
 
 		err error
 	)
 
 	if requester, err = ctx.Providers.OpenIDConnect.NewRFC8628UserAuthorizeRequest(ctx, r); err != nil {
-		ctx.Logger.Errorf("Device Authorization Request failed with error: %s", oauthelia2.ErrorToDebugRFC6749Error(err))
+		ctx.Logger.
+			WithError(oauthelia2.ErrorToDebugRFC6749Error(err)).
+			Error("Device Authorization Request failed with error during the User Authorization Flow")
 
 		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, err)
 
 		return
 	}
 
-	clientID := requester.GetClient().GetID()
+	log := ctx.Logger.WithFields(map[string]any{logging.FieldRequestID: requester.GetID(), logging.FieldClientID: requester.GetClient().GetID()})
 
-	ctx.Logger.Debugf("Device Authorization Request with id '%s' on client with id '%s' is being processed", requester.GetID(), clientID)
+	log.Debug("Device Authorization Request is processing the User Authorization Flow")
 
-	if client, err = ctx.Providers.OpenIDConnect.GetRegisteredClient(ctx, clientID); err != nil {
+	if flowID, err = uuid.Parse(requester.GetRequestForm().Get(oidc.FormParameterFlowID)); err != nil {
+		log.WithError(err).Error("Device Authorization Request failed with error to parse the flow ID during the User Authorization Flow")
+
+		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, oauthelia2.ErrServerError)
+
+		return
+	}
+
+	if consent, err = ctx.Providers.StorageProvider.LoadOAuth2ConsentSessionByChallengeID(ctx, flowID); err != nil {
+		log.WithError(err).Error("Device Authorization Request failed with error to load the consent session during the User Authorization Flow")
+
+		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, oauthelia2.ErrServerError)
+
+		return
+	}
+
+	if client, err = ctx.Providers.OpenIDConnect.GetRegisteredClient(ctx, requester.GetClient().GetID()); err != nil {
 		if errors.Is(err, oauthelia2.ErrNotFound) {
-			ctx.Logger.Errorf("Device Authorization Request with id '%s' on client with id '%s' could not be processed: client was not found", requester.GetID(), clientID)
+			log.WithError(oauthelia2.ErrorToDebugRFC6749Error(err)).Error("Device Authorization Request failed to find client during the User Authorization Flow")
 		} else {
-			ctx.Logger.Errorf("Device Authorization Request with id '%s' on client with id '%s' could not be processed: failed to find client: %s", requester.GetID(), clientID, oauthelia2.ErrorToDebugRFC6749Error(err))
+			log.WithError(oauthelia2.ErrorToDebugRFC6749Error(err)).Error("Device Authorization Request failed to find client due to an unknown error during the User Authorization Flow")
 		}
 
 		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, err)
@@ -86,24 +107,18 @@ func OAuth2DeviceAuthorizationPUT(ctx *middlewares.AutheliaCtx, rw http.Response
 
 	var (
 		userSession session.UserSession
-		consent     *model.OAuth2ConsentSession
-		issuer      *url.URL
 		handled     bool
 	)
 
 	if userSession, err = ctx.GetSession(); err != nil {
-		ctx.Logger.Errorf("Device Authorization Request with id '%s' on client with id '%s' could not be processed: error occurred obtaining session information: %+v", requester.GetID(), client.GetID(), err)
+		log.WithError(err).Error("Device Authorization Request failed to obtain the user session during the User Authorization Flow")
 
-		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, oauthelia2.ErrServerError.WithHint("Could not obtain the user session."))
+		ctx.Providers.OpenIDConnect.WriteRFC8628UserAuthorizeError(ctx, rw, requester, oauthelia2.ErrServerError)
 
 		return
 	}
 
 	issuer = ctx.RootURL()
-
-	if consent, handled = handleOAuth2AuthorizationConsent(ctx, issuer, client, userSession, rw, r, requester); handled {
-		return
-	}
 
 	var details *authentication.UserDetailsExtended
 
