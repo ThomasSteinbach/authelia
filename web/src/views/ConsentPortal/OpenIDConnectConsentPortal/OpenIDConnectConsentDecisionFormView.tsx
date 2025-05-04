@@ -33,6 +33,7 @@ import {
     getConsentResponse,
     postConsentResponseAccept,
     postConsentResponseReject,
+    putDeviceCodeFlowUserCode,
 } from "@services/ConsentOpenIDConnect";
 import { postFirstFactorReauthenticate } from "@services/Password.js";
 import { AutheliaState, AuthenticationLevel } from "@services/State";
@@ -167,6 +168,10 @@ const OpenIDConnectConsentDecisionFormView: React.FC<Props> = (props: Props) => 
 
         if (res.redirect_uri) {
             redirect(res.redirect_uri);
+        } else if (res.flow_id && userCode) {
+            await putDeviceCodeFlowUserCode(res.flow_id, userCode);
+
+            // TODO: Redirect to a complete/close me page.
         } else {
             createErrorNotification(translate("Failed to redirect you"));
             throw new Error("Unable to redirect the user");
